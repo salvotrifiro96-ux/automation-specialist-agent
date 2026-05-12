@@ -365,27 +365,56 @@ def _render_emails_tab() -> None:
             st.markdown(f"**{plan.output_title}**")
             st.caption(f"`{plan.subtype}` · {len(plan.drafts)} mail")
 
-            with st.expander("Vedi le mail"):
-                for d in plan.drafts:
-                    st.markdown(f"**{d.name}**")
+            # Default di selezione: per confirmation_mail nessuna preselezionata
+            # (l'operatore sceglie 1 variante). Per nurturing_* tutte (sequenza
+            # coordinata da creare insieme).
+            default_all = plan.subtype != "confirmation_mail"
+            select_label = (
+                "Seleziona la variante da creare"
+                if plan.subtype == "confirmation_mail"
+                else "Seleziona le mail da creare"
+            )
+            st.markdown(f"**{select_label}**")
+
+            picked_indices: list[int] = []
+            for idx, d in enumerate(plan.drafts):
+                key = f"pick_{plan.output_id}_{idx}"
+                checked = st.checkbox(
+                    f"**{d.name}** — _{d.subject}_",
+                    value=st.session_state.get(key, default_all),
+                    key=key,
+                )
+                if checked:
+                    picked_indices.append(idx)
+                with st.expander("Vedi contenuto"):
                     st.markdown(f"_Subject:_ {d.subject}")
                     st.markdown(f"_Preview:_ {d.preview}")
                     st.text(d.body_text[:500] + ("…" if len(d.body_text) > 500 else ""))
-                    st.divider()
+                    if d.signature:
+                        st.caption(f"Signature:\n{d.signature}")
 
+            n_picked = len(picked_indices)
+            btn_label = (
+                f"📥 Crea {n_picked} draft in HubSpot"
+                if n_picked > 0
+                else "Seleziona almeno una mail"
+            )
             if st.button(
-                f"📥 Crea {len(plan.drafts)} draft in HubSpot",
+                btn_label,
                 key=f"create_{plan.output_id}",
                 type="primary",
+                disabled=(n_picked == 0),
+                use_container_width=True,
             ):
                 if not from_name.strip() or not from_email.strip():
                     st.error("Compila From name + From email")
                 else:
+                    drafts_to_create = [plan.drafts[i] for i in picked_indices]
                     try:
-                        with st.spinner(f"Creo {len(plan.drafts)} email…"):
+                        with st.spinner(f"Creo {n_picked} email…"):
                             results = emails_mod.create_drafts(
                                 client=client,
-                                drafts=list(plan.drafts),
+                                drafts=drafts_to_create,
                                 from_name=from_name,
                                 from_email=from_email,
                                 reply_to=reply_to or None,
