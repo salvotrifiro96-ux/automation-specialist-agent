@@ -139,6 +139,56 @@ def list_importable_outputs(store: SupabaseStore, limit: int = 50) -> list[Impor
     return plans
 
 
+@dataclass(frozen=True)
+class FlatDraft:
+    """Una singola mail del copywriter, gia` esplosa dal plan per la
+    selezione granulare nel workflow picker."""
+
+    plan_output_id: str           # id Supabase del plan di origine
+    plan_subtype: str             # confirmation_mail | nurturing_sequence | nurturing_single
+    plan_title: str
+    draft_index: int              # posizione nel plan (0-based)
+    draft: EmailDraft
+
+    @property
+    def picker_label(self) -> str:
+        """Label leggibile per il selectbox dell'app."""
+        kind = {
+            "confirmation_mail":   "conferma",
+            "nurturing_sequence":  "nurturing",
+            "nurturing_single":    "nurturing-single",
+        }.get(self.plan_subtype, self.plan_subtype)
+        return f"✍️ [{kind}] {self.draft.name}"
+
+    @property
+    def stable_key(self) -> str:
+        return f"{self.plan_output_id}::{self.draft_index}"
+
+
+def list_individual_drafts(
+    store: SupabaseStore, limit: int = 50
+) -> list[FlatDraft]:
+    """Flatten degli output copywriter: ogni mail e` un'opzione separata.
+
+    Usato dalla tab Workflows per popolare i picker email — ogni step della
+    sequenza puo` cosi` agganciare UNA singola mail, anche se viene da un
+    payload `nurturing_sequence` con 5 mail.
+    """
+    flats: list[FlatDraft] = []
+    for plan in list_importable_outputs(store, limit=limit):
+        for idx, draft in enumerate(plan.drafts):
+            flats.append(
+                FlatDraft(
+                    plan_output_id=plan.output_id,
+                    plan_subtype=plan.subtype,
+                    plan_title=plan.output_title,
+                    draft_index=idx,
+                    draft=draft,
+                )
+            )
+    return flats
+
+
 # ── Build payload HubSpot Marketing Email v3 ───────────────────────
 
 

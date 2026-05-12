@@ -37,6 +37,115 @@ from __future__ import annotations
 from typing import Any
 
 
+# Operatori HubSpot supportati per i property filter del trigger.
+# Allineati alla nomenclatura della API v4 (`operation.operator`).
+PROPERTY_OPERATORS: tuple[tuple[str, str], ...] = (
+    ("EQ",                "uguale a"),
+    ("NEQ",               "diverso da"),
+    ("CONTAINS_TOKEN",    "contiene la parola"),
+    ("NOT_CONTAINS_TOKEN","non contiene la parola"),
+    ("STARTED_WITH",      "inizia con"),
+    ("IS_KNOWN",          "ha un valore qualsiasi"),
+    ("IS_NOT_KNOWN",      "non ha valore"),
+    ("GT",                "maggiore di"),
+    ("LT",                "minore di"),
+)
+
+# Operatori che NON richiedono un value (sono booleani sulla property)
+OPERATORS_WITHOUT_VALUE = frozenset({"IS_KNOWN", "IS_NOT_KNOWN"})
+
+
+def _build_property_trigger(
+    *,
+    property_name: str,
+    operator: str,
+    value: str = "",
+) -> dict[str, Any]:
+    """Costruisce il trigger ENROLLMENT_CRITERIA con un filtro property singolo."""
+    operation: dict[str, Any] = {"operator": operator}
+    if operator not in OPERATORS_WITHOUT_VALUE and value:
+        # HubSpot accetta `values` (lista) sui filtri property
+        operation["values"] = [value]
+    return {
+        "type": "ENROLLMENT_CRITERIA",
+        "filters": [
+            [
+                {
+                    "filterType": "PROPERTY",
+                    "property": property_name,
+                    "operation": operation,
+                }
+            ]
+        ],
+    }
+
+
+def build_assignment_v2_payload(
+    *,
+    name: str,
+    trigger_property_name: str,
+    trigger_operator: str,
+    trigger_value: str,
+    target_owner_id: str,
+    confirmation_email_id: str | None = None,
+    delay_minutes: int = 1,
+    enabled: bool = False,
+) -> dict[str, Any]:
+    """Workflow v2: trigger = property condition, action = assegnazione a
+    UN SOLO owner + invio email conferma opzionale.
+
+    Args:
+        trigger_property_name: nome della contact property (es. id_campagna_refresh)
+        trigger_operator: uno di PROPERTY_OPERATORS (EQ, NEQ, CONTAINS_TOKEN, ...)
+        trigger_value: valore di confronto (ignorato per IS_KNOWN/IS_NOT_KNOWN)
+        target_owner_id: l'owner_id HubSpot a cui assegnare
+        confirmation_email_id: email Marketing da inviare dopo l'assegnazione
+        delay_minutes: pausa prima delle action (default 1 min per dare tempo
+            ai dati di stabilizzarsi)
+    """
+    actions: list[dict[str, Any]] = []
+    if delay_minutes > 0:
+        actions.append({
+            "type": "DELAY",
+            "actionTypeVersion": 0,
+            "fields": {"delta": delay_minutes * 60_000, "unit": "MILLISECONDS"},
+        })
+    actions.append({
+        "type": "SET_PROPERTY",
+        "actionTypeVersion": 0,
+        "fields": {
+            "propertyName": "hubspot_owner_id",
+            "objectTypeId": "0-1",
+            "value": str(target_owner_id),
+        },
+    })
+    if confirmation_email_id:
+        actions.append({
+            "type": "SINGLE_CONNECTION",
+            "actionTypeVersion": 0,
+            "fields": {
+                "appId": 113,
+                "subAction": "SEND_MARKETING_EMAIL",
+                "emailContentId": confirmation_email_id,
+            },
+        })
+
+    return {
+        "name": name,
+        "type": "CONTACT_FLOW",
+        "isEnabled": enabled,
+        "objectTypeId": "0-1",
+        "triggers": [
+            _build_property_trigger(
+                property_name=trigger_property_name,
+                operator=trigger_operator,
+                value=trigger_value,
+            )
+        ],
+        "actions": actions,
+    }
+
+
 def build_assignment_workflow_payload(
     *,
     name: str,

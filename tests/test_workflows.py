@@ -1,8 +1,98 @@
 from agent.workflows import (
+    OPERATORS_WITHOUT_VALUE,
+    PROPERTY_OPERATORS,
+    build_assignment_v2_payload,
     build_assignment_workflow_payload,
     build_nurturing_workflow_payload,
     render_workflow_spec_md,
 )
+
+
+class TestAssignmentV2:
+    def test_basic_with_value(self):
+        p = build_assignment_v2_payload(
+            name="X",
+            trigger_property_name="id_campagna_refresh",
+            trigger_operator="EQ",
+            trigger_value="refresh_test",
+            target_owner_id="owner-123",
+        )
+        t = p["triggers"][0]
+        assert t["type"] == "ENROLLMENT_CRITERIA"
+        f = t["filters"][0][0]
+        assert f["property"] == "id_campagna_refresh"
+        assert f["operation"]["operator"] == "EQ"
+        assert f["operation"]["values"] == ["refresh_test"]
+
+    def test_operator_without_value_omits_values_field(self):
+        p = build_assignment_v2_payload(
+            name="X",
+            trigger_property_name="email",
+            trigger_operator="IS_KNOWN",
+            trigger_value="ignored",
+            target_owner_id="o-1",
+        )
+        op = p["triggers"][0]["filters"][0][0]["operation"]
+        assert op["operator"] == "IS_KNOWN"
+        assert "values" not in op
+
+    def test_owner_set_property_action(self):
+        p = build_assignment_v2_payload(
+            name="X",
+            trigger_property_name="lifecyclestage",
+            trigger_operator="EQ",
+            trigger_value="marketingqualifiedlead",
+            target_owner_id="owner-42",
+        )
+        set_actions = [a for a in p["actions"] if a["type"] == "SET_PROPERTY"]
+        assert len(set_actions) == 1
+        assert set_actions[0]["fields"]["propertyName"] == "hubspot_owner_id"
+        assert set_actions[0]["fields"]["value"] == "owner-42"
+
+    def test_delay_optional(self):
+        p_no_delay = build_assignment_v2_payload(
+            name="X",
+            trigger_property_name="email",
+            trigger_operator="IS_KNOWN",
+            trigger_value="",
+            target_owner_id="o-1",
+            delay_minutes=0,
+        )
+        assert not any(a["type"] == "DELAY" for a in p_no_delay["actions"])
+
+        p_with_delay = build_assignment_v2_payload(
+            name="X",
+            trigger_property_name="email",
+            trigger_operator="IS_KNOWN",
+            trigger_value="",
+            target_owner_id="o-1",
+            delay_minutes=5,
+        )
+        delays = [a for a in p_with_delay["actions"] if a["type"] == "DELAY"]
+        assert len(delays) == 1
+        assert delays[0]["fields"]["delta"] == 5 * 60_000
+
+    def test_confirmation_email_appended_last(self):
+        p = build_assignment_v2_payload(
+            name="X",
+            trigger_property_name="email",
+            trigger_operator="IS_KNOWN",
+            trigger_value="",
+            target_owner_id="o-1",
+            confirmation_email_id="email-99",
+        )
+        last = p["actions"][-1]
+        assert last["type"] == "SINGLE_CONNECTION"
+        assert last["fields"]["emailContentId"] == "email-99"
+
+
+class TestPropertyOperatorsConstants:
+    def test_operators_list_nonempty(self):
+        assert len(PROPERTY_OPERATORS) > 0
+
+    def test_operators_without_value_subset(self):
+        codes = {c for c, _ in PROPERTY_OPERATORS}
+        assert OPERATORS_WITHOUT_VALUE.issubset(codes)
 
 
 class TestAssignmentWorkflow:

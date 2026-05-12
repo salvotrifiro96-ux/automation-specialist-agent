@@ -400,19 +400,109 @@ def _render_emails_tab() -> None:
                         st.error(traceback.format_exc())
 
 
-# ── Tab 4: Workflows ───────────────────────────────────────────────
+# ── Tab 4: Workflows (con picker unificato HubSpot + copywriter) ────
+
+
+_NO_EMAIL_KEY = "__none__"
+
+
+def _build_email_picker_options(
+    client: HubSpotClient,
+    store: SupabaseStore | None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, emails_mod.FlatDraft]]:
+    """Costruisce le opzioni del picker email unificato.
+
+    Ritorna:
+      - options: dict label -> {"kind": "hubspot"|"copywriter"|"none", ...}
+      - flats_by_key: cache delle FlatDraft del copywriter (key -> obj)
+        per non doverle ricalcolare al submit.
+    """
+    options: dict[str, dict[str, Any]] = {
+        "— nessuna —": {"kind": "none"},
+    }
+
+    # Email gia` in HubSpot
+    try:
+        existing = client.list_marketing_emails(limit=100)
+    except Exception as e:
+        st.warning(f"Lettura email HubSpot fallita: {e}")
+        existing = []
+    for e in existing:
+        eid = str(e.get("id", ""))
+        nm = (e.get("name") or "")
+        if eid and nm:
+            options[f"📚 HubSpot · {nm} ({eid})"] = {"kind": "hubspot", "id": eid}
+
+    # Output copywriter (Supabase) — flat (1 entry per mail singola)
+    flats_by_key: dict[str, emails_mod.FlatDraft] = {}
+    if store:
+        try:
+            flats = emails_mod.list_individual_drafts(store, limit=50)
+        except Exception as e:
+            st.warning(f"Lettura copywriter Supabase fallita: {e}")
+            flats = []
+        for fd in flats:
+            options[fd.picker_label] = {"kind": "copywriter", "key": fd.stable_key}
+            flats_by_key[fd.stable_key] = fd
+
+    return options, flats_by_key
+
+
+def _resolve_email_choice(
+    *,
+    client: HubSpotClient,
+    choice: dict[str, Any],
+    flats_by_key: dict[str, emails_mod.FlatDraft],
+    from_name: str,
+    from_email: str,
+    reply_to: str,
+    created_cache: dict[str, str],
+) -> str | None:
+    """Da una scelta del picker, ritorna l'`email_id` HubSpot pronto da usare
+    nel workflow. Se la scelta e` "copywriter", crea on-the-fly l'email
+    in HubSpot e ritorna il nuovo id. `created_cache` evita di ricreare
+    la stessa email piu` volte (es. stessa email in piu` step).
+    """
+    kind = choice.get("kind")
+    if kind == "hubspot":
+        return choice["id"]
+    if kind != "copywriter":
+        return None
+
+    key = choice["key"]
+    if key in created_cache:
+        return created_cache[key]
+
+    flat = flats_by_key.get(key)
+    if flat is None:
+        return None
+
+    payload = emails_mod.build_email_payload(
+        draft=flat.draft,
+        from_name=from_name,
+        from_email=from_email,
+        reply_to=reply_to or None,
+    )
+    resp = client.create_marketing_email(payload)
+    eid = str(resp.get("id", ""))
+    if eid:
+        created_cache[key] = eid
+        st.session_state.last_emails.append(resp)
+    return eid
 
 
 def _render_workflows_tab() -> None:
     st.subheader("🔁 Crea workflow")
     st.caption(
-        "Crea il workflow di assegnazione (round-robin advisor) e quello "
-        "di nurturing (sequenza email) collegati a un form."
+        "Picker unificato: scegli email gia` in HubSpot (`📚`) oppure dei "
+        "copy del copywriter (`✍️`). Le `✍️` vengono importate al volo "
+        "come Marketing Email draft quando crei il workflow."
     )
 
     client = _hub()
     if client is None:
         return
+    store = _store()
 
     pool = st.session_state.owner_pool
     if pool is None:
@@ -422,7 +512,7 @@ def _render_workflows_tab() -> None:
         st.error("Pool advisor vuoto — non posso fare round-robin.")
         return
 
-    # Pick form
+    # Form trigger
     try:
         forms = client.list_forms()
     except Exception as e:
@@ -431,52 +521,143 @@ def _render_workflows_tab() -> None:
     if not forms:
         st.warning("Nessun form trovato. Creane uno nel tab Forms.")
         return
-
     form_options = {f"{f.name} ({f.id})": f.id for f in forms if not f.archived}
-    selected_form_label = st.selectbox(
-        "Form trigger del workflow",
-        options=list(form_options),
-    )
+    selected_form_label = st.selectbox("Form trigger del workflow", options=list(form_options))
     triggering_form_id = form_options[selected_form_label]
 
-    # Pick confirmation email (optional)
-    try:
-        emails = client.list_marketing_emails(limit=100)
-    except Exception as e:
-        st.error(f"Lettura email fallita: {e}")
-        emails = []
-    email_options: dict[str, str] = {"— nessuna —": ""}
-    for e in emails:
-        eid = str(e.get("id", ""))
-        nm = e.get("name", "")
-        if eid and nm:
-            email_options[f"{nm} ({eid})"] = eid
+    # Picker email unificato (HubSpot + copywriter)
+    email_options, flats_by_key = _build_email_picker_options(client, store)
 
-    # Workflow A: assegnazione + conferma
-    st.markdown("### A) Assegnazione round-robin + conferma")
-    with st.form("wf_assign"):
-        wf_a_name = st.text_input(
-            "Nome workflow",
-            value=f"[AUTO] Assegnazione + conferma — {selected_form_label}",
+    # Sender per email importate al volo
+    with st.expander("👤 Sender (usato solo per le mail importate dal copywriter)", expanded=False):
+        cols = st.columns(2)
+        from_name = cols[0].text_input(
+            "From name", value="Salvo Trifirò", key="wf_from_name",
         )
+        from_email = cols[1].text_input(
+            "From email (verificata su HubSpot)",
+            value="info@leonemasterschool.com",
+            key="wf_from_email",
+        )
+        reply_to = st.text_input("Reply-to (opzionale)", key="wf_reply_to")
+
+    # ── Workflow A: trigger by property + assegnazione owner singolo ───
+    st.markdown("### A) Assegnazione contatto + conferma")
+    st.caption(
+        "Scegli la condizione di ingresso (su qualunque property contact) e "
+        "l'owner a cui assegnare. Opzionalmente invia un'email di conferma."
+    )
+
+    # Property list per il trigger
+    try:
+        properties = client.list_contact_properties()
+    except Exception as e:
+        st.error(f"Lettura properties fallita: {e}")
+        return
+
+    # Costruisco le opzioni property: preferisco mettere id_campagna_refresh
+    # in cima per accesso rapido.
+    sorted_props = sorted(
+        properties,
+        key=lambda p: (p.name != "id_campagna_refresh", p.label or p.name),
+    )
+    prop_options = {f"{p.label or p.name}  ({p.name})": p.name for p in sorted_props}
+
+    # Owners list (tutti i 93 owner HubSpot, non solo i 10 advisor)
+    try:
+        all_owners = client.list_owners()
+    except Exception as e:
+        st.error(f"Lettura owners fallita: {e}")
+        return
+    owner_options = {
+        f"{o.full_name or o.email}  ({o.email})  id={o.id}": o.id
+        for o in all_owners
+    }
+
+    operator_options = {
+        f"{label}  ({code})": code for code, label in wf_mod.PROPERTY_OPERATORS
+    }
+
+    with st.form("wf_assign_v2"):
+        st.markdown("**Trigger** — il workflow parte quando un contatto matcha:")
+        c1, c2 = st.columns([2, 2])
+        prop_label = c1.selectbox("Property", options=list(prop_options))
+        op_label = c2.selectbox("Operatore", options=list(operator_options))
+        selected_operator = operator_options[op_label]
+        value_needed = selected_operator not in wf_mod.OPERATORS_WITHOUT_VALUE
+        trigger_value = st.text_input(
+            "Valore da matchare",
+            disabled=not value_needed,
+            placeholder="es. refresh_dentisti_2026_05" if value_needed else "(non necessario)",
+        )
+
+        st.markdown("**Azione** — assegna il contatto a:")
+        owner_label = st.selectbox(
+            "Owner HubSpot",
+            options=list(owner_options),
+            help="Tutti gli owner del portal, non solo i 10 advisor del team.",
+        )
+
+        st.markdown("**Email di conferma** (opzionale)")
         chosen_conf_label = st.selectbox(
-            "Email di conferma (opzionale)",
+            "Email da inviare dopo l'assegnazione",
             options=list(email_options),
+            help="📚 esistente in HubSpot · ✍️ da importare al volo dal copywriter",
+        )
+
+        cols = st.columns([3, 1])
+        wf_a_name = cols[0].text_input(
+            "Nome workflow",
+            value="[AUTO] Assegnazione contatto",
+        )
+        delay_min = cols[1].number_input(
+            "Delay iniziale (min)",
+            min_value=0,
+            max_value=60,
+            value=1,
+            help="Pausa prima dell'azione, utile per evitare race condition.",
         )
         enabled = st.checkbox(
-            "Attiva subito (consigliato lasciare disabilitato e rivedere in HubSpot)",
+            "Attiva subito (consigliato disabilitato — rivedi in HubSpot UI prima)",
             value=False,
         )
+
         do_create_a = st.form_submit_button("✨ Crea workflow A", type="primary")
 
     if do_create_a:
-        payload = wf_mod.build_assignment_workflow_payload(
+        if value_needed and not trigger_value.strip():
+            st.error(f"L'operatore `{selected_operator}` richiede un valore.")
+            return
+
+        # Risolve email scelta (eventualmente importa dal copywriter)
+        created_cache: dict[str, str] = {}
+        try:
+            with st.spinner("Preparazione email…"):
+                conf_email_id = _resolve_email_choice(
+                    client=client,
+                    choice=email_options[chosen_conf_label],
+                    flats_by_key=flats_by_key,
+                    from_name=from_name,
+                    from_email=from_email,
+                    reply_to=reply_to,
+                    created_cache=created_cache,
+                )
+        except HubSpotError as e:
+            st.error(f"Import email dal copywriter fallito: {e}")
+            return
+
+        payload = wf_mod.build_assignment_v2_payload(
             name=wf_a_name,
-            triggering_form_id=triggering_form_id,
-            owner_ids_round_robin=list(pool.matched_owner_ids),
-            confirmation_email_id=email_options[chosen_conf_label] or None,
+            trigger_property_name=prop_options[prop_label],
+            trigger_operator=selected_operator,
+            trigger_value=trigger_value.strip(),
+            target_owner_id=owner_options[owner_label],
+            confirmation_email_id=conf_email_id or None,
+            delay_minutes=int(delay_min),
             enabled=enabled,
         )
+        if created_cache:
+            st.info(f"Importate {len(created_cache)} email dal copywriter")
         try:
             with st.spinner("Creazione workflow…"):
                 resp = client.create_workflow(payload)
@@ -489,17 +670,15 @@ def _render_workflows_tab() -> None:
                 "spec da ricreare manualmente in HubSpot Workflows UI."
             )
             st.markdown(wf_mod.render_workflow_spec_md(payload))
-            with st.expander("JSON completo (per troubleshooting/import)"):
+            with st.expander("JSON completo"):
                 st.code(json.dumps(payload, indent=2), language="json")
 
-    # Workflow B: nurturing
+    # ── Workflow B: sequenza nurturing ─────────────────────────────
     st.markdown("### B) Sequenza nurturing")
-    if not emails:
-        st.info("Per il workflow di nurturing servono email gia` create.")
-        return
-
     n_steps = st.slider("Numero step nella sequenza", 1, 8, 4, key="wf_n_steps")
-    sequence: list[dict[str, Any]] = []
+
+    step_choices: list[dict[str, Any]] = []
+    step_delays: list[int] = []
     for i in range(n_steps):
         cols = st.columns([2, 1])
         elabel = cols[0].selectbox(
@@ -514,9 +693,8 @@ def _render_workflows_tab() -> None:
             value=24 * (i + 1),
             key=f"wf_step_delay_{i}",
         )
-        eid = email_options.get(elabel, "")
-        if eid:
-            sequence.append({"day": i + 1, "email_id": eid, "delay_hours": int(delay_h)})
+        step_choices.append(email_options[elabel])
+        step_delays.append(int(delay_h))
 
     with st.form("wf_nurturing"):
         wf_b_name = st.text_input(
@@ -524,17 +702,39 @@ def _render_workflows_tab() -> None:
             value=f"[AUTO] Nurturing — {selected_form_label}",
             key="wf_b_name",
         )
-        enabled_b = st.checkbox(
-            "Attiva subito",
-            value=False,
-            key="wf_b_enabled",
-        )
+        enabled_b = st.checkbox("Attiva subito", value=False, key="wf_b_enabled")
         do_create_b = st.form_submit_button("✨ Crea workflow B", type="primary")
 
     if do_create_b:
+        # Risolve ogni step in email_id (importa dal copywriter se serve)
+        created_cache: dict[str, str] = {}
+        sequence: list[dict[str, Any]] = []
+        try:
+            with st.spinner("Preparazione email della sequenza…"):
+                for i, (choice, delay_h) in enumerate(zip(step_choices, step_delays)):
+                    eid = _resolve_email_choice(
+                        client=client,
+                        choice=choice,
+                        flats_by_key=flats_by_key,
+                        from_name=from_name,
+                        from_email=from_email,
+                        reply_to=reply_to,
+                        created_cache=created_cache,
+                    )
+                    if eid:
+                        sequence.append(
+                            {"day": i + 1, "email_id": eid, "delay_hours": delay_h}
+                        )
+        except HubSpotError as e:
+            st.error(f"Import email dal copywriter fallito: {e}")
+            return
+
         if not sequence:
             st.error("Almeno UN step deve avere un'email valida.")
             return
+        if created_cache:
+            st.info(f"Importate {len(created_cache)} email dal copywriter")
+
         payload = wf_mod.build_nurturing_workflow_payload(
             name=wf_b_name,
             triggering_form_id=triggering_form_id,
