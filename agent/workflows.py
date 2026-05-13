@@ -1,293 +1,120 @@
-"""Costruzione di Workflow v4 (Flows) HubSpot.
+"""Workflow v4 (Flows) HubSpot — un solo builder unificato per il funnel Leone.
 
-Due flussi MVP che il media-automation team Leone vuole avere sempre attivi:
+Scope: un workflow per campagna che gestisce TUTTO il post-iscrizione:
 
-  A. **Workflow di assegnazione + conferma**
-     trigger: form submission (form id passato in input)
-     actions:
-       - delay: 1 minuto (debounce + permette ai dati di stabilirsi)
-       - set property `hubspot_owner_id` round-robin tra il pool advisor
-       - send marketing email "conferma" (id passato in input)
+    trigger:  FORM_SUBMITTED sul form dello step 1
+    actions (in ordine):
+      1. (opzionale) DELAY breve prima della conferma (default 1min)
+      2. (opzionale) SINGLE_CONNECTION send marketing email "conferma"
+      3. per ogni step di nurturing in sequenza:
+         - DELAY (delay_hours convertito in ms)
+         - SINGLE_CONNECTION send marketing email dello step
 
-  B. **Workflow di nurturing**
-     trigger: contact created from a specific source (form submission)
-     actions (sequenza):
-       - delay: N giorni
-       - send marketing email "nurturing day N"
-       - delay: M giorni
-       - send marketing email "nurturing day M+N"
-       - ...
+Il workflow viene sempre creato `isEnabled=False` per safety: l'operatore
+lo rivede in HubSpot UI e lo attiva manualmente.
 
-L'API workflow v4 e` parzialmente in beta. La struttura JSON e` complessa
-ma documentata. Esponiamo due builder helper che producono il payload
-per `POST /automation/v4/flows`.
-
-Note critiche:
-- HubSpot non offre nativamente "round-robin" come action atomica nel
-  workflow v4 builder API. Per fare round-robin reale si usa l'azione
-  "ROTATE_OWNERS" presente nei workflow templates. Qui usiamo una
-  ROTATE_RECORD_TO_OWNER action che HubSpot supporta con un set di
-  staffIds — esattamente quello che ci serve.
-- Se la creation API restituisce 400/501 (alcuni feature flags non attivi
-  sul portale), l'app mostrera` la spec JSON dello workflow per
-  configurazione manuale.
+Se la v4 Flows API rifiuta la creazione (alcune feature flag non sono
+attive su tutti i portal), l'app espone `render_workflow_spec_md(payload)`
+per produrre una spec leggibile da ricreare manualmente in UI.
 """
 from __future__ import annotations
 
 from typing import Any
 
 
-# Operatori HubSpot supportati per i property filter del trigger.
-# Allineati alla nomenclatura della API v4 (`operation.operator`).
-PROPERTY_OPERATORS: tuple[tuple[str, str], ...] = (
-    ("EQ",                "uguale a"),
-    ("NEQ",               "diverso da"),
-    ("CONTAINS_TOKEN",    "contiene la parola"),
-    ("NOT_CONTAINS_TOKEN","non contiene la parola"),
-    ("STARTED_WITH",      "inizia con"),
-    ("IS_KNOWN",          "ha un valore qualsiasi"),
-    ("IS_NOT_KNOWN",      "non ha valore"),
-    ("GT",                "maggiore di"),
-    ("LT",                "minore di"),
-)
-
-# Operatori che NON richiedono un value (sono booleani sulla property)
-OPERATORS_WITHOUT_VALUE = frozenset({"IS_KNOWN", "IS_NOT_KNOWN"})
+# appId interno HubSpot per la send-marketing-email action.
+_MARKETING_APP_ID = 113
 
 
-def _build_property_trigger(
-    *,
-    property_name: str,
-    operator: str,
-    value: str = "",
-) -> dict[str, Any]:
-    """Costruisce il trigger ENROLLMENT_CRITERIA con un filtro property singolo."""
-    operation: dict[str, Any] = {"operator": operator}
-    if operator not in OPERATORS_WITHOUT_VALUE and value:
-        # HubSpot accetta `values` (lista) sui filtri property
-        operation["values"] = [value]
+def _delay_action(delta_ms: int) -> dict[str, Any]:
     return {
-        "type": "ENROLLMENT_CRITERIA",
-        "filters": [
-            [
-                {
-                    "filterType": "PROPERTY",
-                    "property": property_name,
-                    "operation": operation,
-                }
-            ]
-        ],
+        "type": "DELAY",
+        "actionTypeVersion": 0,
+        "fields": {"delta": delta_ms, "unit": "MILLISECONDS"},
     }
 
 
-def build_assignment_v2_payload(
-    *,
-    name: str,
-    trigger_property_name: str,
-    trigger_operator: str,
-    trigger_value: str,
-    target_owner_id: str,
-    confirmation_email_id: str | None = None,
-    delay_minutes: int = 1,
-    enabled: bool = False,
-) -> dict[str, Any]:
-    """Workflow v2: trigger = property condition, action = assegnazione a
-    UN SOLO owner + invio email conferma opzionale.
-
-    Args:
-        trigger_property_name: nome della contact property (es. id_campagna_refresh)
-        trigger_operator: uno di PROPERTY_OPERATORS (EQ, NEQ, CONTAINS_TOKEN, ...)
-        trigger_value: valore di confronto (ignorato per IS_KNOWN/IS_NOT_KNOWN)
-        target_owner_id: l'owner_id HubSpot a cui assegnare
-        confirmation_email_id: email Marketing da inviare dopo l'assegnazione
-        delay_minutes: pausa prima delle action (default 1 min per dare tempo
-            ai dati di stabilizzarsi)
-    """
-    actions: list[dict[str, Any]] = []
-    if delay_minutes > 0:
-        actions.append({
-            "type": "DELAY",
-            "actionTypeVersion": 0,
-            "fields": {"delta": delay_minutes * 60_000, "unit": "MILLISECONDS"},
-        })
-    actions.append({
-        "type": "SET_PROPERTY",
+def _send_email_action(email_id: str) -> dict[str, Any]:
+    return {
+        "type": "SINGLE_CONNECTION",
         "actionTypeVersion": 0,
         "fields": {
-            "propertyName": "hubspot_owner_id",
-            "objectTypeId": "0-1",
-            "value": str(target_owner_id),
+            "appId": _MARKETING_APP_ID,
+            "subAction": "SEND_MARKETING_EMAIL",
+            "emailContentId": email_id,
         },
-    })
-    if confirmation_email_id:
-        actions.append({
-            "type": "SINGLE_CONNECTION",
-            "actionTypeVersion": 0,
-            "fields": {
-                "appId": 113,
-                "subAction": "SEND_MARKETING_EMAIL",
-                "emailContentId": confirmation_email_id,
-            },
-        })
-
-    return {
-        "name": name,
-        "type": "CONTACT_FLOW",
-        "isEnabled": enabled,
-        "objectTypeId": "0-1",
-        "triggers": [
-            _build_property_trigger(
-                property_name=trigger_property_name,
-                operator=trigger_operator,
-                value=trigger_value,
-            )
-        ],
-        "actions": actions,
     }
 
 
-def build_assignment_workflow_payload(
+def _form_trigger(form_id: str) -> dict[str, Any]:
+    return {
+        "type": "FORM_SUBMITTED",
+        "filters": [
+            {
+                "filterType": "PROPERTY",
+                "property": "form_id",
+                "operation": {"operator": "IS_ANY_OF", "values": [form_id]},
+            }
+        ],
+    }
+
+
+def build_funnel_workflow_payload(
     *,
     name: str,
     triggering_form_id: str,
-    owner_ids_round_robin: list[str],
     confirmation_email_id: str | None = None,
+    confirmation_delay_minutes: int = 1,
+    nurturing_sequence: list[dict[str, Any]] | None = None,
     enabled: bool = False,
 ) -> dict[str, Any]:
-    """Workflow A: form submission -> assegnazione round-robin + email conferma.
+    """Costruisce il payload del workflow unico Leone (form -> conferma -> nurturing).
 
     Args:
         name: nome del flow in HubSpot
-        triggering_form_id: l'id del form HubSpot che fa partire il workflow
-        owner_ids_round_robin: lista di owner_id da ruotare in round-robin
-        confirmation_email_id: id della Marketing Email di conferma da inviare
-                                (puo` essere None se la confermi via UI)
-        enabled: se False crea il workflow in stato "draft". Sempre False per
-                 sicurezza — l'operatore lo abilita da HubSpot UI dopo
-                 review.
+        triggering_form_id: id del form HubSpot che fa partire il workflow
+        confirmation_email_id: id Marketing Email da inviare come conferma.
+            Se None, la conferma viene saltata (raro, ma supportato).
+        confirmation_delay_minutes: pausa prima della conferma. Default 1min
+            per dare ai dati il tempo di stabilizzarsi su HubSpot.
+        nurturing_sequence: lista ordinata di step. Ogni step e` un dict:
+            ``{"day": int, "email_id": "...", "delay_hours": int}``.
+            `day` e` informativo (lo usiamo nel nome). `delay_hours` e`
+            l'attesa PRIMA di mandare l'email (rispetto allo step precedente).
+            Step senza `email_id` vengono saltati.
+        enabled: stato iniziale del workflow. Default False — sempre.
 
     Returns:
-        Payload pronto per POST /automation/v4/flows
-    """
-    actions: list[dict[str, Any]] = [
-        {
-            "type": "DELAY",
-            "actionTypeVersion": 0,
-            "fields": {"delta": 60_000, "unit": "MILLISECONDS"},
-        },
-        {
-            "type": "ROTATE_RECORD_TO_OWNER",
-            "actionTypeVersion": 0,
-            "fields": {
-                "ownerSource": "STATIC",
-                "staffIds": owner_ids_round_robin,
-                "propertyName": "hubspot_owner_id",
-                "objectTypeId": "0-1",
-            },
-        },
-    ]
-    if confirmation_email_id:
-        actions.append(
-            {
-                "type": "SINGLE_CONNECTION",
-                "actionTypeVersion": 0,
-                "fields": {
-                    "appId": 113,  # HubSpot internal app id for marketing email
-                    "subAction": "SEND_MARKETING_EMAIL",
-                    "emailContentId": confirmation_email_id,
-                },
-            }
-        )
-
-    return {
-        "name": name,
-        "type": "CONTACT_FLOW",
-        "isEnabled": enabled,
-        "objectTypeId": "0-1",
-        "triggers": [
-            {
-                "type": "FORM_SUBMITTED",
-                "filters": [
-                    {
-                        "filterType": "PROPERTY",
-                        "property": "form_id",
-                        "operation": {"operator": "IS_ANY_OF", "values": [triggering_form_id]},
-                    }
-                ],
-            }
-        ],
-        "actions": actions,
-    }
-
-
-def build_nurturing_workflow_payload(
-    *,
-    name: str,
-    triggering_form_id: str,
-    sequence: list[dict[str, Any]],
-    enabled: bool = False,
-) -> dict[str, Any]:
-    """Workflow B: sequenza nurturing mail.
-
-    Args:
-        sequence: lista ordinata di step. Ogni step e` un dict:
-            {"day": int, "email_id": "...", "delay_hours": int}
-            `day` e` informativo (per il nome dello step), `delay_hours`
-            e` l'attesa effettiva PRIMA di mandare l'email.
-        enabled: come sopra, default False per safety.
+        Payload pronto per ``POST /automation/v4/flows``.
     """
     actions: list[dict[str, Any]] = []
-    for step in sequence:
-        delay_hours = int(step.get("delay_hours", 24))
+
+    if confirmation_email_id:
+        if confirmation_delay_minutes > 0:
+            actions.append(_delay_action(confirmation_delay_minutes * 60_000))
+        actions.append(_send_email_action(confirmation_email_id))
+
+    for step in (nurturing_sequence or []):
         email_id = step.get("email_id")
         if not email_id:
             continue
+        delay_hours = int(step.get("delay_hours", 24))
         if delay_hours > 0:
-            actions.append(
-                {
-                    "type": "DELAY",
-                    "actionTypeVersion": 0,
-                    "fields": {
-                        "delta": delay_hours * 60 * 60 * 1000,
-                        "unit": "MILLISECONDS",
-                    },
-                }
-            )
-        actions.append(
-            {
-                "type": "SINGLE_CONNECTION",
-                "actionTypeVersion": 0,
-                "fields": {
-                    "appId": 113,
-                    "subAction": "SEND_MARKETING_EMAIL",
-                    "emailContentId": email_id,
-                },
-            }
-        )
+            actions.append(_delay_action(delay_hours * 60 * 60 * 1000))
+        actions.append(_send_email_action(email_id))
 
     return {
         "name": name,
         "type": "CONTACT_FLOW",
         "isEnabled": enabled,
         "objectTypeId": "0-1",
-        "triggers": [
-            {
-                "type": "FORM_SUBMITTED",
-                "filters": [
-                    {
-                        "filterType": "PROPERTY",
-                        "property": "form_id",
-                        "operation": {"operator": "IS_ANY_OF", "values": [triggering_form_id]},
-                    }
-                ],
-            }
-        ],
+        "triggers": [_form_trigger(triggering_form_id)],
         "actions": actions,
     }
 
 
 def render_workflow_spec_md(payload: dict[str, Any]) -> str:
-    """Render in markdown del workflow per configurazione manuale (fallback)."""
+    """Render markdown del workflow per ricreazione manuale in HubSpot UI."""
     lines = [f"# Workflow: {payload.get('name', '?')}", ""]
     lines.append(f"**Tipo**: {payload.get('type')}  ")
     lines.append(f"**Object**: {payload.get('objectTypeId')}  ")

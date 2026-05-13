@@ -1,19 +1,18 @@
-"""HubSpot Graph API wrapper esteso per il media-automation team Leone.
+"""HubSpot Graph API wrapper per l'Automation Specialist Agent.
 
-Espone i 5 namespace usati dal team:
-  - properties (custom fields su contacts)
-  - forms        (creazione form lead-magnet)
-  - owners       (lista degli owner del portale)
-  - emails       (creazione marketing email draft)
-  - workflows    (v4 Flows, creazione automazioni)
+Espone solo cio` che serve al wizard a 4 step:
+  - properties:  find / create custom contact field (`id_campagna_refresh`)
+  - forms:       list / create Marketing Forms v3
+  - emails:      list / create Marketing Emails v3
+  - workflows:   create v4 Flow
 
-Niente SDK: requests + REST puro. Solo POST/GET con error wrapping uniforme.
+Niente SDK: requests + REST puro, error wrapping uniforme.
 """
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from typing import Any, Iterable
+from dataclasses import dataclass
+from typing import Any
 
 import requests
 
@@ -51,19 +50,6 @@ class Property:
 
 
 @dataclass(frozen=True)
-class Owner:
-    id: str
-    email: str
-    first_name: str
-    last_name: str
-    user_id: int | None = None
-
-    @property
-    def full_name(self) -> str:
-        return (f"{self.first_name} {self.last_name}").strip() or self.email
-
-
-@dataclass(frozen=True)
 class Form:
     id: str
     name: str
@@ -71,18 +57,8 @@ class Form:
     archived: bool
 
 
-@dataclass(frozen=True)
-class WorkflowSummary:
-    id: str
-    name: str
-    enabled: bool
-
-
-# ── Client ─────────────────────────────────────────────────────────
-
-
 class HubSpotClient:
-    """Wrapper minimale ma typo-safe degli endpoint usati dal team."""
+    """Wrapper minimale ma typo-safe degli endpoint usati dal wizard."""
 
     def __init__(self, access_token: str, portal_id: str = "") -> None:
         if not access_token:
@@ -115,40 +91,7 @@ class HubSpotClient:
         )
         return _check(r, f"POST {path}")
 
-    def _patch(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        r = requests.patch(
-            f"{BASE}{path}",
-            headers=self._headers(),
-            data=json.dumps(body),
-            timeout=30,
-        )
-        return _check(r, f"PATCH {path}")
-
-    def _delete(self, path: str) -> dict[str, Any]:
-        r = requests.delete(
-            f"{BASE}{path}",
-            headers=self._headers(),
-            timeout=30,
-        )
-        return _check(r, f"DELETE {path}")
-
-    # ── Properties (CRM custom fields) ───────────────────────────
-    def list_contact_properties(self) -> list[Property]:
-        data = self._get(
-            "/crm/v3/properties/contacts",
-            params={"archived": "false"},
-        )
-        return [
-            Property(
-                name=p["name"],
-                label=p.get("label", ""),
-                type=p.get("type", ""),
-                field_type=p.get("fieldType", ""),
-                group_name=p.get("groupName", ""),
-            )
-            for p in data.get("results", [])
-        ]
-
+    # ── Properties (custom field id_campagna_refresh) ────────────
     def find_contact_property(self, name: str) -> Property | None:
         try:
             data = self._get(f"/crm/v3/properties/contacts/{name}")
@@ -191,33 +134,6 @@ class HubSpotClient:
             group_name=data.get("groupName", ""),
         )
 
-    # ── Owners ───────────────────────────────────────────────────
-    def list_owners(self, *, only_active: bool = True) -> list[Owner]:
-        out: list[Owner] = []
-        after: str | None = None
-        while True:
-            params: dict[str, Any] = {"limit": 100}
-            if after:
-                params["after"] = after
-            data = self._get("/crm/v3/owners", params=params)
-            for o in data.get("results", []):
-                if only_active and o.get("archived"):
-                    continue
-                out.append(
-                    Owner(
-                        id=str(o["id"]),
-                        email=o.get("email", ""),
-                        first_name=o.get("firstName", ""),
-                        last_name=o.get("lastName", ""),
-                        user_id=o.get("userId"),
-                    )
-                )
-            paging = (data.get("paging") or {}).get("next") or {}
-            after = paging.get("after")
-            if not after:
-                break
-        return out
-
     # ── Forms (Marketing Forms v3) ───────────────────────────────
     def list_forms(self, limit: int = 100) -> list[Form]:
         data = self._get("/marketing/v3/forms", params={"limit": limit})
@@ -238,7 +154,7 @@ class HubSpotClient:
         return out
 
     def create_form(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Crea un form marketing. Il payload va costruito da agent/forms.py."""
+        """Crea un form marketing. Payload da ``agent/forms.py``."""
         return self._post("/marketing/v3/forms", payload)
 
     # ── Marketing Emails ────────────────────────────────────────
@@ -247,23 +163,10 @@ class HubSpotClient:
         return data.get("results", []) or []
 
     def create_marketing_email(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Crea una marketing email in stato draft. Payload da `agent/emails.py`."""
+        """Crea una marketing email in stato draft. Payload da ``agent/emails.py``."""
         return self._post("/marketing/v3/emails/", payload)
 
     # ── Workflows v4 (Flows) ─────────────────────────────────────
-    def list_workflows(self, limit: int = 25) -> list[WorkflowSummary]:
-        data = self._get("/automation/v4/flows", params={"limit": limit})
-        out: list[WorkflowSummary] = []
-        for w in data.get("results", []):
-            out.append(
-                WorkflowSummary(
-                    id=str(w.get("id", "")),
-                    name=w.get("name", ""),
-                    enabled=bool(w.get("isEnabled", False)),
-                )
-            )
-        return out
-
     def create_workflow(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Crea un workflow v4 (Flow). Payload da `agent/workflows.py`."""
+        """Crea un workflow v4 (Flow). Payload da ``agent/workflows.py``."""
         return self._post("/automation/v4/flows", payload)

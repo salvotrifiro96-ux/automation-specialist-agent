@@ -1,36 +1,46 @@
 # Automation Specialist Agent
 
-Agente Streamlit del team marketing Leone — configura HubSpot a partire dagli output prodotti dagli altri agenti.
+Agente Streamlit del team marketing Leone — wizard a 4 step che configura HubSpot per una campagna in un unico flusso lineare.
 
-## Capabilities
+## Scope
 
-- **⚙️ Setup**: verifica/crea la custom property `id_campagna_refresh` sui contatti + matcha i 10 advisor del team (Marvin/Domenico/...) con gli Owner HubSpot
-- **📋 Forms**: crea un form HubSpot nativo con email + first/lastname + telefono + `id_campagna_refresh` hidden (valorizzato dal media-buyer / embed JS)
-- **📧 Marketing Emails**: importa gli output del `copywriter-agent` (subtype `confirmation_mail`, `nurturing_sequence`, `nurturing_single`) come Marketing Email draft, traducendo i placeholder (`[Nome]` → `{{ contact.firstname }}`, ecc.)
-- **🔁 Workflows v4**: crea due workflow
-  - **A**: form submission → delay 1min → assegnazione round-robin tra advisor → invio email di conferma
-  - **B**: form submission → sequenza nurturing (delay + email × N step)
-- **📊 Stato**: report di tutto cio` che e` stato configurato in HubSpot dalla sessione
+Una sola cosa, fatta bene: per ogni nuova campagna del funnel Leone, l'agente crea su HubSpot **form di acquisizione + mail di conferma + sequenza nurturing**, legati da un **unico workflow v4 (Flows)** che parte dal form submission.
 
-## Setup
+## Wizard a 4 step
+
+1. **Form** — nome, `id_campagna_refresh` (hidden field), toggle telefono/cognome, submit label, success message / redirect URL
+2. **Conferma** — picker unificato: scegli tra mail già esistenti su HubSpot (📚) o bozze del [copywriter-agent](https://copywriter-agent.streamlit.app) salvate su Supabase (✍️ — subtype `confirmation_mail`)
+3. **Nurturing** — slider N step (1-8); per ogni step picker (📚 / ✍️ subtype `nurturing_sequence` / `nurturing_single`) + delay ore
+4. **Pubblica** — riepilogo, sender (richiesto solo se ci sono ✍️ da importare), nome workflow, toggle "attiva subito" (default OFF), bottone unico
+
+Al click di "Crea tutto" l'agente esegue in sequenza:
+
+1. Verifica/crea la custom property `id_campagna_refresh` (idempotente)
+2. Crea il form HubSpot Marketing v3
+3. Importa le ✍️ scelte come Marketing Email DRAFT (cache per non duplicare)
+4. Crea il workflow v4 unico: `FORM_SUBMITTED → delay 1min → conferma → delay → step 1 → delay → step 2 → …`
+
+Se la v4 Flows API rifiuta la creazione (feature flag mancante sul portal), l'agente mostra **spec markdown + JSON** per ricostruire il workflow a mano in HubSpot UI.
+
+## Setup locale
 
 ```bash
 cd automation-specialist-agent
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# Compila .env con HUBSPOT_TOKEN, SUPABASE_*, APP_PASSWORD
+# Compila: HUBSPOT_TOKEN, HUBSPOT_PORTAL_ID, SUPABASE_URL, SUPABASE_SECRET_KEY, APP_PASSWORD
 streamlit run app.py
 ```
 
 ### Scope HubSpot richiesti
+
 Private App Token con:
 - `crm.objects.contacts.read` / `.write`
 - `crm.schemas.contacts.read` / `.write`
-- `crm.objects.owners.read`
 - `forms` (read + write)
-- `automation` (per workflows v4)
-- `content` (per Marketing Emails)
+- `automation` (workflows v4)
+- `content` (Marketing Emails)
 
 ### Streamlit Cloud Secrets
 
@@ -48,32 +58,32 @@ SUPABASE_SECRET_KEY = "sb_secret_..."
 pytest
 ```
 
-34 unit test su parsing, build payload, round-robin, placeholder swap.
-
-## Pattern condivisi col team
-
-- Stesso scaffold (Streamlit + python-dotenv + requests)
-- Stessa password gate (`APP_PASSWORD`)
-- Riusa `agent/store.py` (duplicato dai 3 agenti che scrivono — qui solo lettura)
-- Niente Claude/OpenAI (puramente operativo come il media-buyer)
+Unit test su parsing, build payload del workflow unificato, placeholder swap copywriter → HubSpot.
 
 ## Limiti noti (HubSpot API)
 
-- **Workflows v4 (Flows) creation** e` parzialmente in beta. Se la POST `/automation/v4/flows` ritorna 400/501 per feature flag mancanti, l'app mostra la spec markdown + JSON pronti per configurazione manuale in HubSpot UI.
-- **Marketing Email** creation richiede che `fromEmail` sia un indirizzo verificato sul Marketing Hub HubSpot. Se non lo e`, l'email viene creata in DRAFT ma non potra` essere pubblicata fino alla verifica del mittente.
-- **Round-robin** non e` una action atomica HubSpot — usiamo `ROTATE_RECORD_TO_OWNER` con `staffIds` come pool.
+- **Workflows v4 (Flows)** in beta su alcuni portal — se la POST `/automation/v4/flows` ritorna 400/501, l'app mostra la spec da ricreare in UI.
+- **Marketing Email**: `fromEmail` deve essere un indirizzo verificato sul Marketing Hub. Se non lo è, le email vengono create in DRAFT ma non possono essere pubblicate fino alla verifica.
+- **Placeholder copywriter**: `[Nome]` → `{{ contact.firstname }}` (e simili) traduzione automatica. `[LINK]` resta letterale: l'operatore lo sostituisce in HubSpot UI con il link reale.
+
+## Pattern condivisi col team
+
+Stesso scaffold di `copywriter-agent`, `graphic-designer-agent`, `media-buyer-agent`:
+- Streamlit + Password gate `APP_PASSWORD`
+- `_secret(key)` helper env → `st.secrets`
+- `agent/store.py` (REST Supabase, no SDK) — qui solo lettura, niente scrittura
+- Niente Anthropic/OpenAI: puramente operativo, come il media-buyer
 
 ## Struttura
 
 ```
-app.py                 → Streamlit (5 tab)
+app.py                 → Streamlit wizard a 4 step
 agent/
-  hubspot_api.py       → HubSpotClient (REST puro, no SDK)
-  properties.py        → ensure id_campagna_refresh
-  forms.py             → build_form_payload (v3 forms)
-  owners.py            → match team Leone -> hubspot owner_id
-  emails.py            → import copy copywriter -> marketing email
-  workflows.py         → build_assignment / build_nurturing payload v4
-  store.py             → SupabaseStore (riuso pattern)
-tests/                 → pytest, 34 test
+  hubspot_api.py       → HubSpotClient REST (forms, emails, workflows, properties)
+  properties.py        → ensure id_campagna_refresh (idempotente)
+  forms.py             → build_form_payload (Marketing v3)
+  emails.py            → import copy copywriter → Marketing Email + picker FlatDraft
+  workflows.py         → build_funnel_workflow_payload (workflow unico)
+  store.py             → SupabaseStore (REST, lettura output copywriter)
+tests/                 → pytest sui builder e parsing
 ```
