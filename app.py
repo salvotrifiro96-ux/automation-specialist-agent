@@ -22,6 +22,7 @@ from agent import forms as forms_mod
 from agent import properties as props_mod
 from agent import workflows as wf_mod
 from agent.hubspot_api import HubSpotClient, HubSpotError
+from agent.orch_link import linked_project_id, save_to_project_button, sidebar_project_picker
 from agent.store import SupabaseStore
 
 
@@ -725,6 +726,22 @@ def _step_done() -> None:
     st.subheader("✅ Fatto")
     r = st.session_state.result or {}
 
+    # Cross-app: salva risultato workflow nel progetto orchestrator
+    if linked_project_id():
+        save_to_project_button(
+            agent_slug="automation",
+            output={
+                "workflow": r.get("workflow"),
+                "workflow_fallback_md": r.get("workflow_fallback_md"),
+                "workflow_fallback_json": r.get("workflow_fallback_json"),
+                "form": r.get("form"),
+                "property": r.get("property"),
+                "imported_emails": r.get("imported_emails"),
+            },
+            label="🎯 Approva workflow per progetto",
+            key_suffix="automation_done",
+        )
+
     ps = r.get("property")
     if ps:
         verb = "Creata" if ps.get("created") else "Verificata"
@@ -770,6 +787,7 @@ def _step_done() -> None:
 
 
 def _main() -> None:
+    sidebar_project_picker()
     st.title("🔌 Automation Specialist Agent")
     st.caption(
         "Configura HubSpot per una campagna Leone: form di acquisizione + "
