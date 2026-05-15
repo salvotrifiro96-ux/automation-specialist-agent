@@ -129,6 +129,94 @@ def _store() -> SupabaseStore | None:
     return st.session_state._supabase_store
 
 
+def _format_archive_ts(iso_string: str) -> str:
+    try:
+        from datetime import datetime as _dt
+        return _dt.fromisoformat(iso_string.replace("Z", "+00:00")).strftime("%d/%m %H:%M")
+    except Exception:
+        return iso_string[:16]
+
+
+def _archive_save_run(result: dict[str, Any]) -> None:
+    """Salva il run completo del wizard (form_data + result HubSpot) su agent_outputs."""
+    store = _store()
+    if store is None:
+        return
+    form = result.get("form") or {}
+    wf = result.get("workflow") or {}
+    form_data = st.session_state.get("form_data") or {}
+    title = (
+        f"{form_data.get('campaign_id') or form.get('name') or 'workflow'} · "
+        f"{form_data.get('name') or '?'}"
+    )[:200]
+    preview = (
+        f"form_id={form.get('id', '—')} · "
+        f"workflow_id={wf.get('id', '—')}"
+    )
+    payload = {
+        "form_data": form_data,
+        "confirmation_choice": st.session_state.get("confirmation_choice"),
+        "nurturing_steps": st.session_state.get("nurturing_steps"),
+        "publish_meta": {
+            "from_name": st.session_state.get("publish_from_name"),
+            "from_email": st.session_state.get("publish_from_email"),
+            "reply_to": st.session_state.get("publish_reply_to"),
+            "workflow_enabled": st.session_state.get("publish_enabled"),
+        },
+        "result": result,
+    }
+    metadata = {
+        "campaign_id": form_data.get("campaign_id"),
+        "form_id": form.get("id"),
+        "workflow_id": wf.get("id"),
+        "imported_emails": len(result.get("imported_emails") or []),
+    }
+    try:
+        store.save_text_output(
+            agent_type="automation",
+            subtype="workflow_run",
+            title=title,
+            payload=payload,
+            preview=preview,
+            metadata=metadata,
+        )
+    except Exception as e:
+        st.toast(f"Archivio non aggiornato: {e}", icon="⚠️")
+
+
+def _render_archive_sidebar() -> None:
+    store = _store()
+    st.sidebar.divider()
+    st.sidebar.header("📚 Archivio wizard")
+    if store is None:
+        st.sidebar.caption(
+            "Archivio disabilitato: mancano `SUPABASE_URL` e `SUPABASE_SECRET_KEY`."
+        )
+        return
+    try:
+        outputs = store.list_recent_outputs(agent_type="automation", limit=30)
+    except Exception as e:
+        st.sidebar.error(f"Errore archivio: {e}")
+        return
+    if not outputs:
+        st.sidebar.caption("_Nessun workflow salvato ancora._")
+        return
+    for o in outputs:
+        ts = _format_archive_ts(o.get("created_at", ""))
+        title = (o.get("title") or "(senza titolo)")[:60]
+        with st.sidebar.expander(f"{ts} · {title}"):
+            meta = o.get("metadata") or {}
+            st.caption(
+                f"form=`{meta.get('form_id', '—')}` · "
+                f"wf=`{meta.get('workflow_id', '—')}` · "
+                f"mail={meta.get('imported_emails', 0)}"
+            )
+            if (preview := o.get("preview")):
+                st.text(preview[:200])
+            with st.expander("Payload JSON"):
+                st.json(o.get("payload") or {})
+
+
 # ── Email picker (HubSpot + copywriter, unificato) ─────────────────
 
 
@@ -710,6 +798,7 @@ def _do_publish(
                 result["workflow_error"] = str(e)
 
         st.session_state.result = result
+        _archive_save_run(result)
         _set_step("done")
         st.rerun()
 
@@ -788,6 +877,7 @@ def _step_done() -> None:
 
 def _main() -> None:
     sidebar_project_picker()
+    _render_archive_sidebar()
     st.title("🔌 Automation Specialist Agent")
     st.caption(
         "Configura HubSpot per una campagna Leone: form di acquisizione + "
